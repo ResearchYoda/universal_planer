@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+.installed.cfg
+lib/
+lib64/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# MuJoCo
+*.mjb
+*.mjcf.bak
+mjkey.txt
+/tmp/
+
+# Isaac Sim / Isaac Lab / Omniverse
+_isaac_sim/
+omniverse_cache/
+kit/
+.nvidia-omniverse/
+*.usd.bak
+*.usdc
+*.usdz
+*.usda.bak
+__pycache__/
+logs/
+outputs/
+runs/
+
+# Training outputs
+runs/
+logs/
+outputs/
+checkpoints/
+saved_models/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.h5
+*.hdf5
+tensorboard/
+wandb/
+mlruns/
+
+# Data
+data/
+datasets/
+*.csv
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Misc
+*.log
+*.tmp
+*.bak
+.cache/
