@@ -271,6 +271,9 @@ class PPOTrainer:
 
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
         self.scheduler = None
+        # BF16 mixed precision: enabled on CUDA (bfloat16 needs no GradScaler)
+        self._use_amp = (self.device.type == 'cuda' and
+                         torch.cuda.is_bf16_supported())
 
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
@@ -282,7 +285,12 @@ class PPOTrainer:
             for obs_b, act_b, lp_old, ret_b, adv_b, val_old in \
                     buffer.get_batches(self.batch_size):
 
-                lp_new, ent, val = self.policy.evaluate(obs_b, act_b)
+                # Forward in BF16, losses in FP32
+                with torch.autocast('cuda', torch.bfloat16, enabled=self._use_amp):
+                    lp_new, ent, val = self.policy.evaluate(obs_b, act_b)
+                lp_new = lp_new.float()
+                ent    = ent.float()
+                val    = val.float()
 
                 # Policy loss (clipped surrogate)
                 ratio = (lp_new - lp_old).exp()

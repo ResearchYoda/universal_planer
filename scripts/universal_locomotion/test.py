@@ -9,7 +9,7 @@ Usage:
     python scripts/universal_locomotion/test.py --ckpt ckpt_100  # specific ckpt
 """
 
-import os, sys, argparse, warnings
+import os, sys, argparse, warnings, time
 import numpy as np
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -46,8 +46,11 @@ ROBOT_COLORS = {
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 def evaluate(policy, obs_norm: RunningNorm, robot_name: str,
-             n_eps: int, render: bool = False, device='cpu'):
-    """Run policy for n_eps episodes. Returns per-episode metrics."""
+             n_eps: int, render: bool = False, device='cpu',
+             speed: float = 1.0):
+    """Run policy for n_eps episodes. Returns per-episode metrics.
+    speed: playback multiplier (1.0 = realtime, 0.5 = half speed, 0.1 = very slow)
+    """
 
     render_mode = 'human' if render else None
     env = UniversalLocomotionEnv(robot_name, render_mode=render_mode)
@@ -90,6 +93,10 @@ def evaluate(policy, obs_norm: RunningNorm, robot_name: str,
             done = term or trunc
             total_r += rew
             steps   += 1
+
+            # Realtime throttle: MuJoCo timestep is 0.002s × frame_skip(5) = 0.01s/step
+            if render and speed > 0:
+                time.sleep(0.01 / speed)
 
             d = env._data
             x_traj.append(float(d.xpos[1][0]))
@@ -239,7 +246,7 @@ def plot_eval_results(results: dict, out_dir: str):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main(ckpt_tag: str = 'final', render_robot: str = None):
+def main(ckpt_tag: str = 'final', render_robot: str = None, speed: float = 1.0):
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     policy_path  = os.path.join(SAVE_DIR, f'policy_{ckpt_tag}.pt')
@@ -271,7 +278,8 @@ def main(ckpt_tag: str = 'final', render_robot: str = None):
         print(f"\nEvaluating {robot}…")
         render = (robot == render_robot)
         results[robot] = evaluate(
-            policy, obs_norm, robot, N_EVAL_EPS, render=render, device=device
+            policy, obs_norm, robot, N_EVAL_EPS, render=render,
+            device=device, speed=speed
         )
 
     # Summary
@@ -295,5 +303,7 @@ if __name__ == '__main__':
                         help='Checkpoint tag (default: final)')
     parser.add_argument('--render', default=None,
                         help='Robot to show in MuJoCo viewer (e.g. ant)')
+    parser.add_argument('--speed',  type=float, default=1.0,
+                        help='Playback speed multiplier (1=realtime, 0.5=half, 0.1=very slow)')
     args = parser.parse_args()
-    main(ckpt_tag=args.ckpt, render_robot=args.render)
+    main(ckpt_tag=args.ckpt, render_robot=args.render, speed=args.speed)

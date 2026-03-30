@@ -133,11 +133,12 @@ class MultiRobotVecEnv:
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-def train(total_steps: int = 10_000_000,
+def train(total_steps: int = 30_000_000,
           n_per_robot: int = 4,
-          n_steps:     int = 2048,
+          n_steps:     int = 4096,
           device:      str = 'auto',
-          resume:      bool = False):
+          resume:      bool = False,
+          compile:     bool = False):
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -163,6 +164,7 @@ def train(total_steps: int = 10_000_000,
                          batch_size=512, ent_coef=0.02, lr=1e-4,
                          n_epochs=5, vf_coef=0.25, max_grad=0.3)
     buffer  = RolloutBuffer(n_steps, n_envs, OBS_DIM, MAX_DOF, dev)
+    use_amp = (dev.type == 'cuda' and torch.cuda.is_bf16_supported())
 
     total_iters  = total_steps // (n_steps * n_envs)
     start_iter   = 1
@@ -179,6 +181,15 @@ def train(total_steps: int = 10_000_000,
             print("No checkpoint found, starting from scratch.")
 
     policy.to(dev)
+
+    # ── torch.compile (optional, ~20% extra speedup) ──────────────────────
+    if compile:
+        torch._dynamo.config.suppress_errors = True
+        policy = torch.compile(policy, mode='reduce-overhead')
+        trainer.policy = policy
+        print("torch.compile enabled")
+
+    print(f"BF16 AMP: {use_amp}")
 
     # ── LR schedule: warmup 20 iter then linear decay 1e-4 → 1e-5 ───────
     lr_init   = 1e-4
@@ -227,7 +238,12 @@ def train(total_steps: int = 10_000_000,
         policy.eval()
         with torch.no_grad():
             for step in range(n_steps):
-                action_t, log_prob_t, value_t = policy.get_action(obs_t)
+                with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
+                    action_t, log_prob_t, value_t = policy.get_action(obs_t)
+                # Cast to FP32 for buffer storage and env stepping
+                action_t    = action_t.float()
+                log_prob_t  = log_prob_t.float()
+                value_t     = value_t.float()
 
                 actions_np = action_t.cpu().numpy()
                 next_obs_np, rew_np, done_np, infos = vec_env.step(actions_np)
@@ -266,7 +282,9 @@ def train(total_steps: int = 10_000_000,
 
         # Compute returns
         with torch.no_grad():
-            _, _, last_val = policy.get_action(obs_t)
+            with torch.autocast('cuda', torch.bfloat16, enabled=use_amp):
+                _, _, last_val = policy.get_action(obs_t)
+            last_val = last_val.float()
         buffer.compute_returns(last_val)
 
         # PPO update
@@ -312,8 +330,10 @@ def train(total_steps: int = 10_000_000,
 
 def _save(policy, obs_norm, rew_norms,
           log_steps, log_ep_rew, log_pl, log_vl, log_ent, tag='final'):
-    torch.save(policy.state_dict(),
-               os.path.join(SAVE_DIR, f'policy_{tag}.pt'))
+    # Unwrap torch.compile wrapper before saving so keys have no _orig_mod. prefix
+    sd = (policy._orig_mod.state_dict()
+          if hasattr(policy, '_orig_mod') else policy.state_dict())
+    torch.save(sd, os.path.join(SAVE_DIR, f'policy_{tag}.pt'))
     obs_norm.save(os.path.join(SAVE_DIR, f'obs_norm_{tag}.npz'))
     # Save per-robot reward norms
     for robot, rn in rew_norms.items():
@@ -328,18 +348,21 @@ def _save(policy, obs_norm, rew_norms,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--steps',  type=int, default=10_000_000)
-    parser.add_argument('--envs',   type=int, default=4,
+    parser.add_argument('--steps',   type=int, default=30_000_000)
+    parser.add_argument('--envs',    type=int, default=4,
                         help='Parallel envs per robot')
-    parser.add_argument('--nsteps', type=int, default=2048,
+    parser.add_argument('--nsteps',  type=int, default=4096,
                         help='Rollout steps per update')
-    parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--resume', action='store_true',
+    parser.add_argument('--device',  type=str, default='auto')
+    parser.add_argument('--resume',  action='store_true',
                         help='Resume from final checkpoint')
+    parser.add_argument('--compile', action='store_true',
+                        help='torch.compile the policy (~20%% extra speedup)')
     args = parser.parse_args()
 
     train(total_steps=args.steps,
           n_per_robot=args.envs,
           n_steps=args.nsteps,
           device=args.device,
-          resume=args.resume)
+          resume=args.resume,
+          compile=args.compile)
