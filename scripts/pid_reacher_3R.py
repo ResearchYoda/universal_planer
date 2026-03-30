@@ -19,6 +19,14 @@ import os
 import time
 from typing import Optional
 
+import matplotlib
+for _backend in ('TkAgg', 'Qt5Agg', 'Agg'):
+    try:
+        matplotlib.use(_backend)
+        import matplotlib.pyplot as _plt_test  # noqa: F401
+        break
+    except Exception:
+        continue
 import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
