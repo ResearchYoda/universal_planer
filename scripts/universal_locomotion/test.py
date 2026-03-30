@@ -30,7 +30,7 @@ from scripts.universal_locomotion.universal_env import (
     UniversalLocomotionEnv, OBS_DIM, MAX_DOF, ROBOT_CONFIGS
 )
 from scripts.universal_locomotion.ppo import UniversalActorCritic
-from scripts.universal_locomotion.train import RunningNorm, SAVE_DIR
+from scripts.universal_locomotion.train import RunningNorm, SAVE_DIR, _OBS_PIN
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
 N_EVAL_EPS  = 5
@@ -259,7 +259,7 @@ def main(ckpt_tag: str = 'final', render_robot: str = None):
     policy.load_state_dict(torch.load(policy_path, map_location=device))
     policy.to(device).eval()
 
-    obs_norm = RunningNorm.load(obs_norm_path, shape=(OBS_DIM,))
+    obs_norm = RunningNorm.load(obs_norm_path, shape=(OBS_DIM,), pin_indices=_OBS_PIN)
 
     # Training curves
     print("\nPlotting training curves…")

@@ -6,18 +6,19 @@ Universal locomotion environment.
 Wraps Hopper-v5, HalfCheetah-v5, Walker2d-v5, Ant-v5 into a single
 fixed-size observation/action interface using Pgraph morphology vectors.
 
-Observation layout (OBS_DIM = 99):
-  pgraph_norm  [16]  – normalized Pgraph traversal indices  (body_idx / max_idx)
-  jdof_norm    [16]  – normalized DOF per Pgraph entry      (dof / 6)
-  jtype_norm   [16]  – normalized joint type                (type / 3)
-  body_mask    [16]  – 1 for valid Pgraph entries, 0 for padding
-  joint_pos    [ 8]  – actuated joint positions  (clipped to [-1,1] via /π)
-  joint_vel    [ 8]  – actuated joint velocities (clipped to [-3,3] via /10)
-  dof_mask     [ 8]  – 1 for valid DOF slots, 0 for padding
-  root_lin_vel [ 3]  – root body linear velocity  (world frame, from cvel)
-  root_ang_vel [ 3]  – root body angular velocity (world frame, from cvel)
-  root_height  [ 1]  – root body z height
-  root_quat    [ 4]  – root body quaternion [w, x, y, z]
+Observation layout (OBS_DIM = 139)
+-----------------------------------
+Morph tokens  [16 × 5 = 80]   — one token per Pgraph slot:
+  [pgraph_norm, jdof_norm, jtype_norm, body_mass_norm, body_mask]
+
+Joint tokens  [ 8 × 6 = 48]   — one token per actuated DOF slot:
+  [joint_pos, joint_vel, dof_mask, lim_lo_norm, lim_hi_norm, gear_norm]
+
+Root state    [        11]
+  root_lin_vel(3), root_ang_vel(3), root_height(1), root_quat(4)
+
+The interleaved layout (features grouped by token) lets the policy network
+directly reshape obs → (16,5) morph tokens and (8,6) joint tokens.
 
 Action space: Box(-1, 1, (8,))
   First n_actuators elements are applied; the rest are masked to zero.
@@ -29,9 +30,19 @@ import gymnasium as gym
 from gymnasium import spaces
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_BODIES = 16   # Ant-v5 Pgraph has exactly 16 entries
-MAX_DOF    = 8    # Ant-v5 has 8 actuated DOF
-OBS_DIM    = MAX_BODIES * 4 + MAX_DOF * 3 + 11   # = 64 + 24 + 11 = 99
+MAX_BODIES  = 16    # Ant-v5 Pgraph has exactly 16 entries
+MAX_DOF     = 8     # Ant-v5 has 8 actuated DOF
+N_MORPH     = MAX_BODIES   # alias used by ppo.py / train.py
+N_JOINT     = MAX_DOF      # alias used by ppo.py / train.py
+NODE_FEAT   = 5     # per Pgraph slot: pgraph_norm, jdof_norm, jtype_norm, body_mass_norm, body_mask
+JOINT_FEAT  = 6     # per DOF slot:   joint_pos, joint_vel, dof_mask, lim_lo_norm, lim_hi_norm, gear_norm
+ROOT_FEAT   = 11    # root_lin_vel(3) + root_ang_vel(3) + root_height(1) + root_quat(4)
+OBS_DIM     = MAX_BODIES * NODE_FEAT + MAX_DOF * JOINT_FEAT + ROOT_FEAT   # = 139
+
+# Normalization anchors (consistent across all supported robots)
+_MASS_MAX  = 10.0    # > max single-body mass observed (~6.25 for HalfCheetah torso)
+_GEAR_MAX  = 300.0   # > max gear observed (Ant = 300)
+_LIM_SCALE = np.pi   # joint limits in radians → divide by π → approx [-1, 1]
 
 _DOF_PER_JTYPE = {0: 6, 1: 3, 2: 1, 3: 1}   # free, ball, slide, hinge
 
@@ -44,7 +55,7 @@ ROBOT_CONFIGS = {
 
 
 # ── Pgraph builder ────────────────────────────────────────────────────────────
-def _build_pgraph(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _build_pgraph(model) -> tuple:
     """
     Traverse the MuJoCo kinematic tree with the Pgraph algorithm
     (Yazar & Yesiloglu 2018, Fig. 4) and return:
@@ -53,19 +64,17 @@ def _build_pgraph(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
       jtype  – first joint type at each entry (0 if no joints)
     """
     n = model.nbody
-
-    children: dict[int, list[int]] = {i: [] for i in range(n)}
+    children = {i: [] for i in range(n)}
     for i in range(1, n):
         children[int(model.body_parentid[i])].append(i)
 
     untraversed = {i: list(cs) for i, cs in children.items()}
     pgraph, jdof, jtype = [], [], []
-    sbs: list[int] = []
-    curr = 1                     # body 0 = world; start at root body (1)
+    sbs: list = []
+    curr = 1
 
     while True:
         pgraph.append(curr)
-
         adr = int(model.body_jntadr[curr])
         cnt = int(model.body_jntnum[curr])
         if cnt > 0 and adr >= 0:
@@ -85,7 +94,6 @@ def _build_pgraph(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             curr = untraversed[curr].pop(0)
             continue
 
-        # backtrack via SBS
         while True:
             if not sbs:
                 return np.array(pgraph), np.array(jdof), np.array(jtype)
@@ -96,7 +104,6 @@ def _build_pgraph(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             sep_cnt = int(model.body_jntnum[sep])
             jtype.append(int(model.jnt_type[sep_adr])
                          if sep_cnt > 0 and sep_adr >= 0 else 0)
-
             if untraversed[sep]:
                 curr = untraversed[sep].pop(0)
                 if not untraversed[sep]:
@@ -110,8 +117,10 @@ def _build_pgraph(model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 class UniversalLocomotionEnv(gym.Env):
     """
     Fixed obs/action wrapper around standard MuJoCo locomotion envs.
-    The morphology vectors (Pgraph, jdof, jtype) are precomputed once and
-    embedded in every observation, giving the policy structural context.
+
+    All morphology vectors (Pgraph, jdof, jtype, body mass, joint limits, gear)
+    are precomputed once in __init__ and embedded in every observation, giving
+    the policy structural and dynamic context about the robot it is controlling.
     """
 
     metadata = {'render_modes': ['human', 'rgb_array']}
@@ -130,7 +139,7 @@ class UniversalLocomotionEnv(gym.Env):
 
         self.n_actuators = self._model.nu      # 3 / 6 / 6 / 8
 
-        # ── Build static morphology vectors ──────────────────────────────
+        # ── Build static morphology vectors ──────────────────────────
         pgraph, jdof, jtype = _build_pgraph(self._model)
         n_pg = len(pgraph)
 
@@ -141,23 +150,45 @@ class UniversalLocomotionEnv(gym.Env):
 
         n = min(n_pg, MAX_BODIES)
         max_idx = float(max(pgraph.max(), 1))
-        self._pgraph_pad[:n] = pgraph[:n] / max_idx          # [0, 1]
-        self._jdof_pad[:n]   = jdof[:n]   / 6.0              # free joint = 1.0
-        self._jtype_pad[:n]  = jtype[:n]  / 3.0              # hinge = 1.0
+        self._pgraph_pad[:n] = pgraph[:n] / max_idx
+        self._jdof_pad[:n]   = jdof[:n]   / 6.0
+        self._jtype_pad[:n]  = jtype[:n]  / 3.0
         self._body_mask[:n]  = 1.0
 
-        # ── Actuated joint indices in qpos / qvel ────────────────────────
-        self._qpos_ids: list[int] = []
-        self._qvel_ids: list[int] = []
+        # ── Body mass per Pgraph slot (dynamic parameter) ─────────────
+        self._body_mass_norm = np.zeros(MAX_BODIES, np.float32)
+        self._body_mass_norm[:n] = (
+            self._model.body_mass[pgraph[:n]].astype(np.float32) / _MASS_MAX
+        )
+
+        # ── Actuated joint indices in qpos / qvel ────────────────────
+        self._qpos_ids: list = []
+        self._qvel_ids: list = []
+        self._jnt_ids:  list = []
         for a in range(self._model.nu):
             jid = int(self._model.actuator_trnid[a, 0])
             self._qpos_ids.append(int(self._model.jnt_qposadr[jid]))
             self._qvel_ids.append(int(self._model.jnt_dofadr[jid]))
+            self._jnt_ids.append(jid)
 
-        self._dof_mask = np.zeros(MAX_DOF, np.float32)
+        # ── Per-actuator dynamic parameters ──────────────────────────
+        self._dof_mask   = np.zeros(MAX_DOF, np.float32)
+        self._lim_lo     = np.zeros(MAX_DOF, np.float32)
+        self._lim_hi     = np.zeros(MAX_DOF, np.float32)
+        self._gear_norm  = np.zeros(MAX_DOF, np.float32)
+
         self._dof_mask[:self.n_actuators] = 1.0
+        for a, jid in enumerate(self._jnt_ids):
+            lo = float(self._model.jnt_range[jid, 0])
+            hi = float(self._model.jnt_range[jid, 1])
+            # Joints without limits (jnt_limited=0) keep 0
+            if bool(self._model.jnt_limited[jid]):
+                self._lim_lo[a] = np.clip(lo / _LIM_SCALE, -2.0, 0.0)
+                self._lim_hi[a] = np.clip(hi / _LIM_SCALE,  0.0, 2.0)
+            gear = float(self._model.actuator_gear[a, 0])
+            self._gear_norm[a] = np.clip(gear / _GEAR_MAX, 0.0, 2.0)
 
-        # ── Spaces ────────────────────────────────────────────────────────
+        # ── Spaces ────────────────────────────────────────────────────
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
@@ -169,7 +200,7 @@ class UniversalLocomotionEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         d = self._data
 
-        # Actuated joints
+        # Actuated joints (dynamic state)
         joint_pos = np.zeros(MAX_DOF, np.float32)
         joint_vel = np.zeros(MAX_DOF, np.float32)
         joint_pos[:self.n_actuators] = np.clip(
@@ -181,25 +212,36 @@ class UniversalLocomotionEnv(gym.Env):
             -3.0, 3.0
         )
 
-        # Root body (body 1): cvel = [ang_vel(3), lin_vel(3)] in world frame
+        # Root body (body 1): cvel = [ang_vel(3), lin_vel(3)]
         root_lin_vel = d.cvel[1][3:6].astype(np.float32)
         root_ang_vel = d.cvel[1][0:3].astype(np.float32)
         root_height  = np.array([d.xpos[1][2]], np.float32)
-        root_quat    = d.xquat[1].astype(np.float32)          # [w, x, y, z]
+        root_quat    = d.xquat[1].astype(np.float32)
 
-        return np.concatenate([
-            self._pgraph_pad,   # 16
-            self._jdof_pad,     # 16
-            self._jtype_pad,    # 16
-            self._body_mask,    # 16
-            joint_pos,          #  8
-            joint_vel,          #  8
-            self._dof_mask,     #  8
-            root_lin_vel,       #  3
-            root_ang_vel,       #  3
-            root_height,        #  1
-            root_quat,          #  4
-        ])                      # = 99
+        # Morph tokens: shape (MAX_BODIES, NODE_FEAT) → flatten to 80
+        # Per node: [pgraph_norm, jdof_norm, jtype_norm, body_mass_norm, body_mask]
+        morph_tokens = np.stack([
+            self._pgraph_pad,
+            self._jdof_pad,
+            self._jtype_pad,
+            self._body_mass_norm,
+            self._body_mask,
+        ], axis=1).flatten()   # (16, 5) → (80,)
+
+        # Joint tokens: shape (MAX_DOF, JOINT_FEAT) → flatten to 48
+        # Per joint: [joint_pos, joint_vel, dof_mask, lim_lo_norm, lim_hi_norm, gear_norm]
+        joint_tokens = np.stack([
+            joint_pos,
+            joint_vel,
+            self._dof_mask,
+            self._lim_lo,
+            self._lim_hi,
+            self._gear_norm,
+        ], axis=1).flatten()   # (8, 6) → (48,)
+
+        root_state = np.concatenate([root_lin_vel, root_ang_vel, root_height, root_quat])
+
+        return np.concatenate([morph_tokens, joint_tokens, root_state])  # = 139
 
     # ── Gym interface ─────────────────────────────────────────────────────────
     def reset(self, seed=None, options=None):

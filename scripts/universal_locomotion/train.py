@@ -28,27 +28,36 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from scripts.universal_locomotion.universal_env import (
-    UniversalLocomotionEnv, OBS_DIM, MAX_DOF, ROBOT_CONFIGS
+    UniversalLocomotionEnv, OBS_DIM, MAX_DOF, ROBOT_CONFIGS,
+    N_MORPH, NODE_FEAT, N_JOINT, JOINT_FEAT
 )
 from scripts.universal_locomotion.ppo import (
     UniversalActorCritic, PPOTrainer, RolloutBuffer
 )
 
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
-ROBOTS           = list(ROBOT_CONFIGS.keys())   # ['hopper','halfcheetah','walker2d','ant']
-SAVE_DIR         = os.path.join(os.path.dirname(__file__), 'checkpoints')
-LOG_PATH         = os.path.join(os.path.dirname(__file__), 'train_log.npz')
+ROBOTS   = list(ROBOT_CONFIGS.keys())
+SAVE_DIR = os.path.join(os.path.dirname(__file__), 'checkpoints')
+
+# Binary mask features in obs — must NOT be renormalized by RunningNorm
+# body_mask: index 4 of each 5-feature morph token  → slots 4,9,14,...,79
+# dof_mask:  index 2 of each 6-feature joint token  → slots 82,88,...,124
+_OBS_PIN = (
+    [i * NODE_FEAT + (NODE_FEAT - 1) for i in range(N_MORPH)] +     # body_mask
+    [N_MORPH * NODE_FEAT + i * JOINT_FEAT + 2 for i in range(N_JOINT)]  # dof_mask
+)
 
 
-# ── Running normalizer (online mean/std) ─────────────────────────────────────
+# ── Running normalizer (online mean/std, with optional pinned indices) ────────
 class RunningNorm:
-    """Welford online obs/reward normalizer."""
+    """Welford online normalizer. pin_indices: obs dims passed through unchanged."""
 
-    def __init__(self, shape, clip=10.0):
+    def __init__(self, shape, clip=10.0, pin_indices=None):
         self.mean  = np.zeros(shape, np.float64)
         self.var   = np.ones(shape,  np.float64)
         self.count = 1e-4
         self.clip  = clip
+        self._pin  = np.array(pin_indices, dtype=int) if pin_indices is not None else None
 
     def update(self, x: np.ndarray):
         batch  = x.reshape(-1, x.shape[-1])
@@ -64,16 +73,19 @@ class RunningNorm:
         self.count = total
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8),
-                       -self.clip, self.clip).astype(np.float32)
+        result = np.clip((x - self.mean) / np.sqrt(self.var + 1e-8),
+                         -self.clip, self.clip).astype(np.float32)
+        if self._pin is not None:
+            result[..., self._pin] = x[..., self._pin].astype(np.float32)
+        return result
 
     def save(self, path):
         np.savez(path, mean=self.mean, var=self.var, count=self.count)
 
     @classmethod
-    def load(cls, path, shape, clip=10.0):
+    def load(cls, path, shape, clip=10.0, pin_indices=None):
         d = np.load(path)
-        obj = cls(shape, clip)
+        obj = cls(shape, clip, pin_indices=pin_indices)
         obj.mean, obj.var, obj.count = d['mean'], d['var'], float(d['count'])
         return obj
 
@@ -141,13 +153,15 @@ def train(total_steps: int = 10_000_000,
     n_envs  = vec_env.n_envs
 
     # Shared observation norm; per-robot reward norms
-    obs_norm  = RunningNorm((OBS_DIM,))
+    obs_norm  = RunningNorm((OBS_DIM,), pin_indices=_OBS_PIN)
     rew_norms = {r: RunningNorm((1,)) for r in ROBOTS}
 
     # ── Policy & trainer ─────────────────────────────────────────────────
     policy  = UniversalActorCritic(obs_dim=OBS_DIM, action_dim=MAX_DOF)
+    # Transformer needs lower lr + fewer epochs than MLP to stay stable
     trainer = PPOTrainer(policy, n_steps=n_steps, device=device,
-                         batch_size=512, ent_coef=0.02, lr=3e-4)
+                         batch_size=512, ent_coef=0.02, lr=1e-4,
+                         n_epochs=5, vf_coef=0.25, max_grad=0.3)
     buffer  = RolloutBuffer(n_steps, n_envs, OBS_DIM, MAX_DOF, dev)
 
     total_iters  = total_steps // (n_steps * n_envs)
@@ -160,19 +174,22 @@ def train(total_steps: int = 10_000_000,
         if os.path.exists(policy_path):
             print(f"Resuming from {policy_path}")
             policy.load_state_dict(torch.load(policy_path, map_location=device))
-            obs_norm = RunningNorm.load(obs_norm_path, shape=(OBS_DIM,))
+            obs_norm = RunningNorm.load(obs_norm_path, shape=(OBS_DIM,), pin_indices=_OBS_PIN)
         else:
             print("No checkpoint found, starting from scratch.")
 
     policy.to(dev)
 
-    # ── LR schedule: linear decay 3e-4 → 3e-5 ────────────────────────────
-    lr_init = 3e-4
-    lr_end  = 3e-5
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        trainer.optimizer,
-        lambda t: max(1.0 - (t / total_iters) * (1 - lr_end/lr_init), lr_end/lr_init)
-    )
+    # ── LR schedule: warmup 20 iter then linear decay 1e-4 → 1e-5 ───────
+    lr_init   = 1e-4
+    lr_end    = 1e-5
+    warmup    = 20
+    def _lr_fn(t):
+        if t < warmup:
+            return (t + 1) / warmup       # linear warmup
+        prog = (t - warmup) / max(total_iters - warmup, 1)
+        return max(1.0 - prog * (1 - lr_end / lr_init), lr_end / lr_init)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(trainer.optimizer, _lr_fn)
     trainer.set_scheduler(scheduler)
 
     # ── Entropy coefficient schedule: 0.02 → 0.005 ───────────────────────
