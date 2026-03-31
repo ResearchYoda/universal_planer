@@ -123,22 +123,20 @@ def run_demo(robot: str, checkpoint: str | None, num_envs: int, n_episodes: int,
         else:
             actions = torch.randn(num_envs, num_actions, device=device) * 0.1
 
-        obs_td, rewards, terminated, truncated, infos = vec_env.step(actions)
-        dones = terminated | truncated
+        # RslRlVecEnvWrapper.step returns (obs, rew, dones, infos)
+        obs_td, rewards, dones, infos = vec_env.step(actions)
 
         # Log per-episode stats when any env resets
-        if dones.any() and "episode" in infos:
-            for key in ["pos_error", "ori_error", "success"]:
-                if key in infos["episode"]:
-                    vals = infos["episode"][key][dones].cpu().numpy()
-                    if key == "pos_error":
-                        pos_errors.extend(vals.tolist())
-                    elif key == "ori_error":
-                        ori_errors.extend(vals.tolist())
-                    elif key == "success":
-                        successes.extend(vals.tolist())
+        if dones.any():
             ep += int(dones.sum())
             print(f"  Episodes completed: {ep}/{n_episodes}", end="\r")
+            # rsl_rl packs episode metrics into extras["log"]
+            log = infos.get("log", {})
+            for k, v in log.items():
+                if "position_error" in k and v is not None:
+                    pos_errors.append(float(v))
+                elif "orientation_error" in k and v is not None:
+                    ori_errors.append(float(v))
 
     print()
     print(f"\n{'='*50}")
