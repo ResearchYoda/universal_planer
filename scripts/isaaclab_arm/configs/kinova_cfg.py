@@ -26,14 +26,17 @@ class KinovaGen3PGraphReachEnvCfg(UniversalArmReachEnvCfg):
         # ── Robot ─────────────────────────────────────────────────────────────
         self.scene.robot = KINOVA_GEN3_N7_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        # ── Asset cfg helpers ─────────────────────────────────────────────────
-        arm_cfg = SceneEntityCfg("robot", joint_names=["joint_[1-7]"])
+        # ── Asset cfg helpers — each obs term gets its own instance ──────────
         ee_cfg = SceneEntityCfg("robot", body_names=[KINOVA_GEN3_EE_BODY])
 
         # ── Observations ──────────────────────────────────────────────────────
         self.observations.policy.pgraph.params["robot_name"] = "kinova_gen3"
-        self.observations.policy.padded_joint_pos.params["asset_cfg"] = arm_cfg
-        self.observations.policy.padded_joint_vel.params["asset_cfg"] = arm_cfg
+        self.observations.policy.padded_joint_pos.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=["joint_[1-7]"]
+        )
+        self.observations.policy.padded_joint_vel.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=["joint_[1-7]"]
+        )
         self.observations.policy.ee_pose.params["asset_cfg"] = ee_cfg
 
         # ── Actions (7-DOF joint position control) ────────────────────────────

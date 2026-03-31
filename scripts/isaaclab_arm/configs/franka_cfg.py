@@ -21,14 +21,17 @@ class FrankaPGraphReachEnvCfg(UniversalArmReachEnvCfg):
         # ── Robot ────────────────────────────────────────────────────────────
         self.scene.robot = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        # ── Asset cfg helpers ────────────────────────────────────────────────
-        arm_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"])
+        # ── Asset cfg helpers — each obs term gets its own instance ──────────
         ee_cfg = SceneEntityCfg("robot", body_names=["panda_hand"])
 
         # ── Observations ─────────────────────────────────────────────────────
         self.observations.policy.pgraph.params["robot_name"] = "franka"
-        self.observations.policy.padded_joint_pos.params["asset_cfg"] = arm_cfg
-        self.observations.policy.padded_joint_vel.params["asset_cfg"] = arm_cfg
+        self.observations.policy.padded_joint_pos.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=["panda_joint.*"]
+        )
+        self.observations.policy.padded_joint_vel.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=["panda_joint.*"]
+        )
         self.observations.policy.ee_pose.params["asset_cfg"] = ee_cfg
 
         # ── Actions (7-DOF joint position control) ────────────────────────────

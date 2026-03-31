@@ -13,7 +13,13 @@ AppLauncher MUST be launched before any Isaac Lab imports.
 """
 
 import argparse
+import os
 import sys
+
+# Ensure project root is on sys.path so 'scripts.*' imports work after AppLauncher
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 # ── 1. AppLauncher (must be first) ─────────────────────────────────────────────
 from isaaclab.app import AppLauncher
@@ -37,7 +43,6 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 # ── 2. Remaining imports (after AppLauncher) ───────────────────────────────────
-import os
 import time
 from datetime import datetime
 
@@ -70,7 +75,7 @@ ROBOT_ENV_MAP = {
 def make_env(robot: str, num_envs: int, device: str):
     """Create a vectorized Isaac Lab env for the given robot."""
     env_id = ROBOT_ENV_MAP[robot]
-    from isaaclab.utils.io import load_cfg_from_registry
+    from isaaclab_tasks.utils import load_cfg_from_registry
     env_cfg = load_cfg_from_registry(env_id, "env_cfg_entry_point")
     env_cfg.scene.num_envs = num_envs
     env_cfg.sim.device = device

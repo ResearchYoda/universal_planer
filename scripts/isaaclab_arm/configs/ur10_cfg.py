@@ -22,15 +22,17 @@ class UR10PGraphReachEnvCfg(UniversalArmReachEnvCfg):
         self.scene.robot = UR10_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.events.reset_robot_joints.params["position_range"] = (0.75, 1.25)
 
-        # ── Asset cfg helpers ─────────────────────────────────────────────────
-        # UR10 joint pattern ".*" selects all 6 arm joints
-        arm_cfg = SceneEntityCfg("robot", joint_names=[".*"])
+        # ── Asset cfg helpers — each obs term gets its own instance ──────────
         ee_cfg = SceneEntityCfg("robot", body_names=["ee_link"])
 
         # ── Observations ──────────────────────────────────────────────────────
         self.observations.policy.pgraph.params["robot_name"] = "ur10"
-        self.observations.policy.padded_joint_pos.params["asset_cfg"] = arm_cfg
-        self.observations.policy.padded_joint_vel.params["asset_cfg"] = arm_cfg
+        self.observations.policy.padded_joint_pos.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=[".*"]
+        )
+        self.observations.policy.padded_joint_vel.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=[".*"]
+        )
         self.observations.policy.ee_pose.params["asset_cfg"] = ee_cfg
 
         # ── Actions (6-DOF joint position control) ────────────────────────────

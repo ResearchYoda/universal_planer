@@ -141,6 +141,10 @@ class PGraphTransformerActorCritic(nn.Module):
     # ── Properties required by rsl_rl PPO ────────────────────────────────────
 
     @property
+    def is_recurrent(self) -> bool:
+        return False
+
+    @property
     def action_mean(self) -> torch.Tensor:
         return self.distribution.mean
 
