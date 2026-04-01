@@ -52,6 +52,7 @@ from isaaclab_tasks.utils import load_cfg_from_registry
 
 import scripts.isaaclab_arm  # noqa: F401  (registers gym envs)
 from scripts.isaaclab_arm.policy import PGraphTransformerActorCritic
+from scripts.isaaclab_arm.pgraph import MAX_JOINTS
 
 ROBOT_ENV_MAP = {
     "franka": "Isaac-PGraph-Reach-Franka-Play-v0",
@@ -61,27 +62,48 @@ ROBOT_ENV_MAP = {
 
 
 def find_latest_checkpoint(robot: str) -> str | None:
-    """Find the most recent checkpoint in logs/pgraph_arm/<robot>/."""
-    pattern = os.path.join("logs", "pgraph_arm", robot, "*", "model_*.pt")
-    files = sorted(glob.glob(pattern))
-    return files[-1] if files else None
+    """Find the most recent checkpoint.
+
+    Search order:
+      1. Joint multi-robot logs that include this robot (e.g. franka_ur10/)
+      2. Single-robot logs for this robot (e.g. franka/)
+    """
+    candidates = []
+    # Joint logs: any dir whose name contains the robot name
+    for entry in glob.glob(os.path.join("logs", "pgraph_arm", f"*{robot}*", "*", "model_*.pt")):
+        candidates.append(entry)
+    # Single-robot logs
+    for entry in glob.glob(os.path.join("logs", "pgraph_arm", robot, "*", "model_*.pt")):
+        candidates.append(entry)
+    return sorted(candidates)[-1] if candidates else None
 
 
-def load_policy(checkpoint: str, num_actions: int, device: str) -> PGraphTransformerActorCritic:
-    """Load policy from checkpoint."""
-    obs_dummy = TensorDict(
-        {"policy": torch.zeros(1, 78)},  # OBS_DIM=78
-        batch_size=[1],
-    )
+def load_policy(checkpoint: str, device: str) -> PGraphTransformerActorCritic:
+    """Load a universal policy from checkpoint.
+
+    Always builds the policy with num_actions=MAX_JOINTS so joint-trained
+    checkpoints (which use MAX_JOINTS action dims) load without surgery.
+    The demo loop slices actions to the env's actual DOF before stepping.
+    """
+    obs_dummy = TensorDict({"policy": torch.zeros(1, 78)}, batch_size=[1])
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
-    policy = PGraphTransformerActorCritic(obs_dummy, obs_groups, num_actions)
+    policy = PGraphTransformerActorCritic(obs_dummy, obs_groups, MAX_JOINTS)
+
     state = torch.load(checkpoint, map_location=device, weights_only=False)
-    # rsl_rl saves {"model_state_dict": ...} or raw state dict
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
-    # Extract actor_critic weights if wrapped
     ac_state = {k.replace("actor_critic.", ""): v for k, v in state.items()
                 if k.startswith("actor_critic.")} or state
+
+    # Resize _log_std if checkpoint came from a single-robot run (e.g. 7-dim Franka)
+    if "_log_std" in ac_state:
+        ckpt_dim = ac_state["_log_std"].shape[0]
+        if ckpt_dim != MAX_JOINTS:
+            new_std = ac_state["_log_std"].mean().expand(MAX_JOINTS).clone()
+            new_std[:ckpt_dim] = ac_state["_log_std"]
+            ac_state["_log_std"] = new_std
+            print(f"[INFO] _log_std resized {ckpt_dim}→{MAX_JOINTS} (single→universal)")
+
     policy.load_state_dict(ac_state, strict=False)
     policy.to(device).eval()
     return policy
@@ -97,8 +119,8 @@ def run_demo(robot: str, checkpoint: str | None, num_envs: int, n_episodes: int,
     env = gym.make(env_id, cfg=env_cfg, render_mode=render_mode)
     vec_env = RslRlVecEnvWrapper(env)
 
-    num_actions = vec_env.num_actions
-    print(f"[INFO] robot={robot}  num_actions={num_actions}  num_envs={num_envs}")
+    env_num_actions = vec_env.num_actions  # robot's actual DOF (6 for UR10, 7 for Franka)
+    print(f"[INFO] robot={robot}  env_num_actions={env_num_actions}  policy_num_actions={MAX_JOINTS}  num_envs={num_envs}")
 
     if checkpoint is None:
         checkpoint = find_latest_checkpoint(robot)
@@ -107,21 +129,23 @@ def run_demo(robot: str, checkpoint: str | None, num_envs: int, n_episodes: int,
         policy = None
     else:
         print(f"[INFO] Loading checkpoint: {checkpoint}")
-        policy = load_policy(checkpoint, num_actions, device)
+        policy = load_policy(checkpoint, device)
 
     # ── Evaluation loop ────────────────────────────────────────────────────────
     pos_errors, ori_errors, successes = [], [], []
     ep = 0
 
-    obs_td, _ = vec_env.get_observations(), None
+    obs_td = vec_env.get_observations()
     dones = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     while ep < n_episodes:
         if policy is not None:
             with torch.no_grad():
-                actions = policy.act_inference(obs_td)
+                # Policy outputs MAX_JOINTS actions; slice to env's actual DOF
+                actions_full = policy.act_inference(obs_td)
+                actions = actions_full[:, :env_num_actions]
         else:
-            actions = torch.randn(num_envs, num_actions, device=device) * 0.1
+            actions = torch.randn(num_envs, env_num_actions, device=device) * 0.1
 
         # RslRlVecEnvWrapper.step returns (obs, rew, dones, infos)
         obs_td, rewards, dones, infos = vec_env.step(actions)
@@ -130,12 +154,17 @@ def run_demo(robot: str, checkpoint: str | None, num_envs: int, n_episodes: int,
         if dones.any():
             ep += int(dones.sum())
             print(f"  Episodes completed: {ep}/{n_episodes}", end="\r")
-            # rsl_rl packs episode metrics into extras["log"]
-            log = infos.get("log", {})
+            # Isaac Lab packs episode metrics into extras["log"] or extras["episode"]
+            log = infos.get("log", infos.get("episode", {}))
             for k, v in log.items():
-                if "position_error" in k and v is not None:
+                if v is None:
+                    continue
+                # Tensors: take mean over envs that just reset
+                if hasattr(v, "shape"):
+                    v = float(v[dones].mean()) if dones.any() and v.shape == dones.shape else float(v.mean())
+                if "position_error" in k:
                     pos_errors.append(float(v))
-                elif "orientation_error" in k and v is not None:
+                elif "orientation_error" in k:
                     ori_errors.append(float(v))
 
     print()
