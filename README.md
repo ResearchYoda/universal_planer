@@ -1,6 +1,104 @@
-# Universal Locomotion Planner
+# Universal Locomotion & Arm Reach Planner
 
-Morphology-aware universal locomotion policy across heterogeneous robot bodies (Hopper, HalfCheetah, Walker2d, Ant) using pGraph encoding, Transformer self-attention, and Physics-Informed Neural Networks.
+Morphology-aware universal policies across heterogeneous robot bodies using **pGraph encoding**, Transformer self-attention, and Physics-Informed Neural Networks.
+
+Two task domains:
+- **Locomotion** — Hopper, HalfCheetah, Walker2d, Ant (MuJoCo / Gymnasium)
+- **Arm Reach** — Franka Panda, UR10, Kinova Gen3 (Isaac Lab / Isaac Sim)
+
+---
+
+## Isaac Lab — Universal Arm Reach Policy
+
+> **Branch:** `feature/isaaclab-pgraph-arm`
+
+### Method
+
+A single pGraph Transformer policy controls Franka (7-DOF) and UR10 (6-DOF) for end-effector reach tasks. The key insight: pad all robots to `MAX_JOINTS=8` and encode each joint as a graph node with topology features `[depth, type, lim_lo, lim_hi, mask]`. The Transformer attends over joint + EE + goal tokens, masking padding slots.
+
+**Universal action space:** policy always outputs `MAX_JOINTS=8` actions. A thin wrapper slices to each robot's actual DOF before stepping the environment.
+
+**Curriculum training** (Isaac Lab only allows one SimulationContext per process, so robots train sequentially):
+```
+Step 1:  train --robot franka --iterations 1500              (sıfırdan)
+Step 2:  train --robot ur10   --iterations 1500 --resume <franka_ckpt>
+Step 3:  train --robot franka --iterations 1500 --resume <ur10_ckpt>
+Step N:  alternating rounds until convergence
+```
+
+### Architecture
+
+```
+Observation (78-dim, same for all robots):
+  [0:40]   pGraph features    — (MAX_JOINTS=8, 5)  [depth, type, lim_lo, lim_hi, mask]
+  [40:48]  padded_joint_pos   — (8,)  zero-padded
+  [48:56]  padded_joint_vel   — (8,)  zero-padded
+  [56:63]  ee_pose            — (7,)  [pos(3) + quat_wxyz(4)]
+  [63:70]  goal_pose          — (7,)
+  [70:78]  padded_last_action — (8,)  zero-padded
+
+Token construction (10 tokens × 8 dims → project to d_model=128):
+  Joint tokens 0-7 : cat(pgraph[i]:5, pos[i]:1, vel[i]:1, act[i]:1)
+  EE token      8  : cat(ee_pose:7, 0:1)
+  Goal token    9  : cat(goal_pose:7, 0:1)
+
+Transformer Encoder: 2 layers, 4 heads, pre-LN, padding mask on pgraph[i,4]==0
+Actor head:   joint tokens[:num_actions] → Linear(d_model, 1) → action means
+Critic head:  mean-pool valid tokens → MLP → V(s)
+```
+
+### Curriculum Training Results
+
+| Round | Robot | Checkpoint | Pos Error (train) | Pos Error (demo, 50 ep) | Ori Error (demo) |
+|---|---|---|---|---|---|
+| R1 | Franka | `franka/2026-03-31_.../model_1499.pt` | 0.033 m | **0.033 m** | — |
+| R2 | UR10 ← Franka R1 | `ur10/2026-04-01_.../model_1499.pt` | 0.340 m | 0.310 m | 30.9° |
+| R3 | Franka ← UR10 R2 | `franka/2026-04-01_.../model_1499.pt` | 0.089 m | **0.098 m** | 19.3° |
+| R4 | UR10 ← Franka R3 | `ur10/2026-04-02_.../model_1499.pt` | 0.221 m | **0.174 m** | 40.0° |
+
+UR10 position error improves ~44% per curriculum round (0.340 → 0.174 m after R4). Franka remains stable across rounds (0.033 → 0.098 m at R3, recovering with more training).
+
+### Usage
+
+```bash
+# Train single robot (sıfırdan)
+conda run -n env_isaaclab python scripts/isaaclab_arm/train.py \
+    --robot franka --num_envs 1024 --iterations 1500 --headless
+
+# Fine-tune on another robot (curriculum)
+conda run -n env_isaaclab python scripts/isaaclab_arm/train.py \
+    --robot ur10 --num_envs 1024 --iterations 1500 --headless \
+    --resume logs/pgraph_arm/franka/<run>/model_1499.pt
+
+# Evaluate / headless demo
+conda run -n env_isaaclab python scripts/isaaclab_arm/test.py \
+    --robot ur10 --checkpoint logs/pgraph_arm/ur10/<run>/model_900.pt \
+    --num_envs 4 --episodes 50 --headless
+
+# Live Isaac Sim demo
+conda run -n env_isaaclab python scripts/isaaclab_arm/test.py \
+    --robot franka --checkpoint logs/pgraph_arm/franka/<run>/model_1499.pt \
+    --num_envs 16 --episodes 200
+```
+
+### Key Files
+
+```
+scripts/isaaclab_arm/
+├── policy.py          # PGraphTransformerActorCritic (d_model=128, 2L, 4H)
+├── pgraph.py          # Per-robot topology features (Franka / UR10 / Kinova)
+├── env_cfg.py         # UniversalArmReachEnvCfg — 78-dim fixed obs
+├── train.py           # PPO training + --resume curriculum support
+├── test.py            # Evaluation loop + metric parsing
+├── multi_robot_env.py # MultiRobotVecEnv (designed for joint training;
+│                      #   blocked by Isaac Lab single-SimulationContext
+│                      #   constraint — use --resume instead)
+├── agent_cfg.py       # UniversalArmPPORunnerCfg
+└── configs/
+    ├── franka_cfg.py  # 7-DOF, panda_hand EE
+    ├── ur10_cfg.py    # 6-DOF, ee_link EE
+    └── kinova_cfg.py  # 7-DOF, end_effector_link EE
+```
 
 ---
 
@@ -8,6 +106,11 @@ Morphology-aware universal locomotion policy across heterogeneous robot bodies (
 
 ```
 scripts/
+├── isaaclab_arm/              # Isaac Lab — Universal Arm Reach (this branch)
+│   ├── policy.py              # PGraphTransformerActorCritic
+│   ├── train.py               # PPO + curriculum --resume
+│   └── configs/               # Franka / UR10 / Kinova
+│
 ├── universal_locomotion/      # V3 — Transformer pGraph policy (main)
 │   ├── universal_env.py       # OBS_DIM=139, structured token obs layout
 │   ├── ppo.py                 # UniversalActorCritic (Transformer, 25 tokens)
