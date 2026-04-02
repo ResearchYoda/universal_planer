@@ -48,18 +48,14 @@ kit/
 *.usdz
 *.usda.bak
 __pycache__/
-logs/
 outputs/
 runs/
 
-# Training outputs
+# Training outputs — tracked via Git LFS (*.pt, *.pth)
 runs/
-logs/
 outputs/
 checkpoints/
 saved_models/
-*.pt
-*.pth
 *.ckpt
 *.pkl
 *.h5
